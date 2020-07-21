@@ -102,6 +102,36 @@ func newETCD3HealthCheck(c storagebackend.Config) (func() error, error) {
 	}, nil
 }
 
+// newETCD3ClientPerTransport returns an etcd client for the given transport config c.
+// A destroy func is returned. If all destroy funcs with the same transport are called, the client is stopped.
+func newETCD3ClientPerTransport(c storagebackend.TransportConfig) (*clientv3.Client, func(), error) {
+	etcdClientsMu.Lock()
+	defer etcdClientsMu.Unlock()
+
+	key := fmt.Sprintf("%v", c) // gives: {[server1 server2] keyFile certFile caFile}
+	if etcdClients[key] == nil {
+		client, err := newETCD3Client(c)
+		if err != nil {
+			return nil, nil, err
+		}
+		etcdClients[key] = &etcdClient{client: client}
+	}
+
+	etcdClients[key].refs++
+
+	stopFunc := func() {
+		etcdClientsMu.Lock()
+		defer etcdClientsMu.Unlock()
+
+		etcdClients[key].refs--
+		if etcdClients[key].refs == 0 {
+			etcdClients[key].client.Close()
+			delete(etcdClients, key)
+		}
+	}
+	return etcdClients[key].client, stopFunc, nil
+}
+
 func newETCD3Client(c storagebackend.TransportConfig) (*clientv3.Client, error) {
 	tlsInfo := transport.TLSInfo{
 		CertFile:      c.CertFile,
@@ -159,6 +189,11 @@ type runningCompactor struct {
 	refs     int
 }
 
+type etcdClient struct {
+	client *clientv3.Client
+	refs   int
+}
+
 var (
 	// compactorsMu guards access to compactors map
 	compactorsMu sync.Mutex
@@ -166,6 +201,9 @@ var (
 	// dbMetricsMonitorsMu guards access to dbMetricsMonitors map
 	dbMetricsMonitorsMu sync.Mutex
 	dbMetricsMonitors   map[string]struct{}
+	// etcdClientsMu guards access to etcdClients
+	etcdClientsMu sync.Mutex
+	etcdClients   = map[string]*etcdClient{}
 )
 
 // startCompactorOnce start one compactor per transport. If the interval get smaller on repeated calls, the
@@ -223,7 +261,7 @@ func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, e
 		return nil, nil, err
 	}
 
-	client, err := newETCD3Client(c.Transport)
+	client, stopClient, err := newETCD3ClientPerTransport(c.Transport)
 	if err != nil {
 		stopCompactor()
 		return nil, nil, err
@@ -242,7 +280,7 @@ func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, e
 		once.Do(func() {
 			stopCompactor()
 			stopDBSizeMonitor()
-			client.Close()
+			stopClient()
 		})
 	}
 	transformer := c.Transformer
